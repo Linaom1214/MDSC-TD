@@ -167,20 +167,20 @@ class MTTM_Process(nn.Module):
         x4 = self.reconstruct_4(encoded4)
         return x4 + en4, cur_memory_list
 
-def get_MTTU_Net_config():
+def get_MDSC_TD_config():
     config = ml_collections.ConfigDict()
     config.transformer = ml_collections.ConfigDict()
-    config.QKV_size = 128 * 4 
-    config.transformer.num_layers = 4 
-    config.patch_sizes = [16, 8, 4, 2] 
-    config.base_channel = 32 
-    config.n_classes = 1 
+    config.QKV_size = 128 * 4
+    config.transformer.num_layers = 4
+    config.patch_sizes = [16, 8, 4, 2]
+    config.base_channel = 32
+    config.n_classes = 1
     return config
 
 # ===========================================================================
-#  [最终版] MTTU_plus
+#  MDSC_TD
 # ===========================================================================
-class MTTU_plus(nn.Module):
+class MDSC_TD(nn.Module):
     def __init__(self, config, n_channels=1, n_classes=1, vis=False, mode='train', deepsuper=True):
         super().__init__()
         self.vis = vis
@@ -290,8 +290,8 @@ if __name__ == '__main__':
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    config_vit = get_MTTU_Net_config()
-    model = MTTU_plus(config_vit, n_channels=1, n_classes=config_vit.n_classes, mode='test', deepsuper=True, vis=False)
+    config_vit = get_MDSC_TD_config()
+    model = MDSC_TD(config_vit, n_channels=1, n_classes=config_vit.n_classes, mode='test', deepsuper=True, vis=False)
     model = model.to(device)
     model.eval()
 

@@ -8,8 +8,8 @@ This repository currently provides the **model definition only**, released durin
 
 ## Contents
 
-- `model/MTTU_S_mask.py` — the proposed model (class `MTTU_plus`), used to produce the paper's main results.
-- `model/MTTU_ablation.py` — the ablation-configurable variant, exposing the module switches used in the paper's ablation studies.
+- `model/MDSC_TD.py` — the proposed model (class `MDSC_TD`), used to produce the paper's main results.
+- `model/MDSC_TD_ablation.py` — the ablation-configurable variant (class `MDSC_TD_Ablation`), exposing the module switches used in the paper's ablation studies.
 - `model/memory/` — the memory-attention module shared by both, adapted from [SAM 2](https://github.com/facebookresearch/sam2) (Meta Platforms, Apache-2.0); original copyright headers are preserved.
 
 Both model files are self-contained (each defines its own config helper and forward smoke test under `if __name__ == '__main__'`) and only depend on `model/memory/`.

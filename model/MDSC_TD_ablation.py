@@ -20,7 +20,7 @@ from model.memory.module import MModule
 from model.memory.sam2_utils import get_activation_fn, get_clones
 
 # ===========================================================================
-#  辅助模块 (Copied from MTTU_S_mask.py)
+#  辅助模块 (Copied from MDSC_TD.py)
 # ===========================================================================
 
 class Fast_MTTU_Head(nn.Module):
@@ -249,20 +249,20 @@ class MTTM_Process(nn.Module):
             x4 = F.interpolate(x4, size=en4.shape[-2:], mode='bilinear', align_corners=True)
         return x4 + en4, cur_memory_list
 
-def get_MTTU_Net_config():
+def get_MDSC_TD_config():
     config = ml_collections.ConfigDict()
     config.transformer = ml_collections.ConfigDict()
-    config.QKV_size = 128 * 4 
-    config.transformer.num_layers = 4 
-    config.patch_sizes = [16, 8, 4, 2] 
-    config.base_channel = 32 
-    config.n_classes = 1 
+    config.QKV_size = 128 * 4
+    config.transformer.num_layers = 4
+    config.patch_sizes = [16, 8, 4, 2]
+    config.base_channel = 32
+    config.n_classes = 1
     return config
 
 # ===========================================================================
-#  [消融实验版] MTTU_Ablation
+#  MDSC_TD_Ablation
 # ===========================================================================
-class MTTU_Ablation(nn.Module):
+class MDSC_TD_Ablation(nn.Module):
     def __init__(self, config, n_channels=1, n_classes=1, vis=False,
                  mode='train', deepsuper=True,
                  # 消融实验开关与参数
@@ -476,15 +476,15 @@ if __name__ == '__main__':
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    config_vit = get_MTTU_Net_config()
-    
+    config_vit = get_MDSC_TD_config()
+
     # Example: Testing Ablation Variant (Disable MTTM)
     print("\n--- Testing Variant: w/o MTTM ---")
-    model = MTTU_Ablation(config_vit, n_channels=1, n_classes=config_vit.n_classes, mode='test', 
-                          deepsuper=True, vis=False, 
+    model = MDSC_TD_Ablation(config_vit, n_channels=1, n_classes=config_vit.n_classes, mode='test',
+                          deepsuper=True, vis=False,
                           use_mttm=False, use_aadhead=True, use_mask=True).to(device)
     model.eval()
-    
+
     inputs = torch.rand(2, 1, 256, 256).to(device)
     output, _ = model(inputs, None, None)
     if isinstance(output, tuple):
@@ -494,8 +494,8 @@ if __name__ == '__main__':
 
     # Example: Testing Variant (Disable AADHead)
     print("\n--- Testing Variant: w/o AADHead ---")
-    model_no_aad = MTTU_Ablation(config_vit, n_channels=1, n_classes=config_vit.n_classes, mode='test', 
-                                 deepsuper=True, vis=False, 
+    model_no_aad = MDSC_TD_Ablation(config_vit, n_channels=1, n_classes=config_vit.n_classes, mode='test',
+                                 deepsuper=True, vis=False,
                                  use_mttm=True, use_aadhead=False, use_mask=True).to(device)
     model_no_aad.eval()
     output, _ = model_no_aad(inputs, None, None)
