@@ -12,18 +12,18 @@ import numbers
 from thop import profile # 用于计算 FLOPs
 from torch.distributions.gamma import Gamma
 
-import sys 
-sys.path.append('../') 
+import sys
+sys.path.append('../')
 
 # 假设这些外部依赖依然存在
-from model.memory.module import MModule 
+from model.memory.module import MModule
 from model.memory.sam2_utils import get_activation_fn, get_clones
 
 # ===========================================================================
 #  辅助模块
 # ===========================================================================
 
-class Fast_MTTU_Head(nn.Module):
+class PixelShuffleHead(nn.Module):
     """
     接收 H/2, W/2 的特征图，通过 PixelShuffle 直接输出 H, W 的预测结果。
     """
@@ -88,7 +88,12 @@ class Decoder(nn.Module):
         x1 = F.interpolate(x1, size=x2.shape[2:], mode='bilinear', align_corners=True)
         return self.ghost(torch.cat((x1, x2), dim=1))
 
-class AADHead(nn.Module):
+class SHT(nn.Module):
+    """Statistical Hypothesis Testing feature-calibration head.
+
+    Models background feature energy with a Gamma distribution and
+    applies a pixel-wise deviation-based gain (paper Sec. III-C).
+    """
     def __init__(self, c_in: int, C: int = 8, alpha: float = 0.001):
         super().__init__()
         self.C = C
@@ -133,37 +138,46 @@ class Reconstruct(nn.Module):
         x = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=True)
         return self.activation(self.norm(self.conv(x)))
 
-class MMAttention(nn.Module):
+class STMICrossAttention(nn.Module):
+    """Cross-frame memory retrieval + intra-frame context enhancement."""
     def __init__(self, config):
-        super(MMAttention, self).__init__()
+        super(STMICrossAttention, self).__init__()
         self.attn_norm = LayerNorm3d(config.QKV_size, LayerNorm_type='WithBias')
-        self.channel_attn = MModule() 
+        self.channel_attn = MModule()
     def forward(self, emb4, prev_state):
         normed = self.attn_norm(emb4)
         processed = normed + self.channel_attn(normed, prev_state) if prev_state is not None else normed
         return emb4 + processed, emb4 + processed
 
-class MTTM(nn.Module):
+class STMIBlock(nn.Module):
     def __init__(self, config, vis):
-        super(MTTM, self).__init__()
+        super(STMIBlock, self).__init__()
         self.encoder_norm4 = LayerNorm3d(config.QKV_size, LayerNorm_type='WithBias')
-        self.layers = MMAttention(config)
+        self.layers = STMICrossAttention(config)
     def forward(self, emb4, prev_memory_list):
         current_emb4, output_memory_state = self.layers(emb4, prev_memory_list)
         return self.encoder_norm4(current_emb4), output_memory_state
 
-class MTTM_Process(nn.Module):
+class STMI(nn.Module):
+    """Spatio-Temporal Memory Interaction module (paper Sec. III-B).
+
+    The Sparse Prior-Guided (SPG) mask injection is nested here: the
+    previous-frame mask is added to the bottleneck feature before the
+    cross-frame attention, confining memory retrieval to prior-flagged
+    regions.
+    """
     def __init__(self, config, vis, channel_num, patchSize):
         super().__init__()
         self.embeddings_4 = Normalized_Patch_Embedding(patchSize[3], channel_num[3], config.QKV_size)
-        self.mttm = MTTM(config, vis)
+        self.stmi_block = STMIBlock(config, vis)
         self.reconstruct_4 = Reconstruct(config.QKV_size, channel_num[3], kernel_size=1, scale_factor=patchSize[3])
 
     def forward(self, en4, prev_memory_list, prev_mask):
+        # SPG: sparse prior-guided mask injection
         if prev_mask is not None:
             en4 = en4 + prev_mask
         emb4 = self.embeddings_4(en4)
-        encoded4, cur_memory_list = self.mttm(emb4, prev_memory_list)
+        encoded4, cur_memory_list = self.stmi_block(emb4, prev_memory_list)
         x4 = self.reconstruct_4(encoded4)
         return x4 + en4, cur_memory_list
 
@@ -186,39 +200,39 @@ class MDSC_TD(nn.Module):
         self.vis = vis
         self.deepsuper = deepsuper
         self.mode = mode
-        
+
         ch_base = config.base_channel # 32
 
         # Encoder Path
-        self.layer1 = Encoder(n_channels, ch_base, stride=1) 
-        self.layer2 = Encoder(ch_base, ch_base * 2)          
-        self.layer3 = Encoder(ch_base * 2, ch_base * 4)      
-        self.layer4 = Encoder(ch_base * 4, ch_base * 8)      
-        self.layer5 = Encoder(ch_base * 8, ch_base * 8)      
+        self.layer1 = Encoder(n_channels, ch_base, stride=1)
+        self.layer2 = Encoder(ch_base, ch_base * 2)
+        self.layer3 = Encoder(ch_base * 2, ch_base * 4)
+        self.layer4 = Encoder(ch_base * 4, ch_base * 8)
+        self.layer5 = Encoder(ch_base * 8, ch_base * 8)
 
-        # MTTM at Bottleneck
-        self.mttm_p = MTTM_Process(config, vis,
-                                   channel_num=[ch_base, ch_base * 2, ch_base * 4, ch_base * 8],
-                                   patchSize=config.patch_sizes)
-        
+        # STMI (with nested SPG) at Bottleneck
+        self.stmi = STMI(config, vis,
+                          channel_num=[ch_base, ch_base * 2, ch_base * 4, ch_base * 8],
+                          patchSize=config.patch_sizes)
+
         # Decoder Path
-        self.up_decoder4 = Decoder(ch_base * 8 + ch_base * 8, ch_base * 4) 
-        self.up_decoder3 = Decoder(ch_base * 4 + ch_base * 4, ch_base * 2) 
-        self.up_decoder2 = Decoder(ch_base * 2 + ch_base * 2, ch_base)     
+        self.up_decoder4 = Decoder(ch_base * 8 + ch_base * 8, ch_base * 4)
+        self.up_decoder3 = Decoder(ch_base * 4 + ch_base * 4, ch_base * 2)
+        self.up_decoder2 = Decoder(ch_base * 2 + ch_base * 2, ch_base)
 
         # Heads
         # Fast Head 接收融合后的特征，通过 PixelShuffle x2 放大到全尺寸
-        self.fast_head = Fast_MTTU_Head(in_channels=ch_base, n_classes=n_classes, scale=2)
-        
-        # AADHead 作用于 Decoder 2 输出 (低分辨率)
-        self.cls = AADHead(c_in=ch_base, C=8, alpha=0.001)
+        self.fast_head = PixelShuffleHead(in_channels=ch_base, n_classes=n_classes, scale=2)
+
+        # SHT 作用于 Decoder 2 输出 (低分辨率)
+        self.sht = SHT(c_in=ch_base, C=8, alpha=0.001)
 
         # Deep Supervision
         if self.deepsuper:
-            self.ds_conv5 = nn.Conv2d(ch_base * 8, n_classes, kernel_size=1) 
-            self.ds_conv4 = nn.Conv2d(ch_base * 4, n_classes, kernel_size=1) 
-            self.ds_conv3 = nn.Conv2d(ch_base * 2, n_classes, kernel_size=1) 
-            self.ds_conv2 = nn.Conv2d(ch_base, n_classes, kernel_size=1)     
+            self.ds_conv5 = nn.Conv2d(ch_base * 8, n_classes, kernel_size=1)
+            self.ds_conv4 = nn.Conv2d(ch_base * 4, n_classes, kernel_size=1)
+            self.ds_conv3 = nn.Conv2d(ch_base * 2, n_classes, kernel_size=1)
+            self.ds_conv2 = nn.Conv2d(ch_base, n_classes, kernel_size=1)
             self.ds_outconv = nn.Conv2d(n_classes * 5, n_classes, kernel_size=1)
 
         # Mask Downscaling (16x for Bottleneck)
@@ -234,54 +248,54 @@ class MDSC_TD(nn.Module):
 
     def forward(self, x, prev_memory_list=None, prev_mask=None):
         # 1. Encoder
-        e1 = self.layer1(x)     
-        e2 = self.layer2(e1)    
-        e3 = self.layer3(e2)    
-        e4 = self.layer4(e3)    
-        bottleneck = self.layer5(e4) 
+        e1 = self.layer1(x)
+        e2 = self.layer2(e1)
+        e3 = self.layer3(e2)
+        e4 = self.layer4(e3)
+        bottleneck = self.layer5(e4)
 
         # 2. Mask Prep
         mask = self.mask_downscaling(prev_mask) if prev_mask is not None else None
-            
-        # 3. MTTM at Bottleneck
-        mttm_bottleneck, cur_memory_list = self.mttm_p(bottleneck, prev_memory_list, mask)
+
+        # 3. STMI (+ SPG) at Bottleneck
+        stmi_bottleneck, cur_memory_list = self.stmi(bottleneck, prev_memory_list, mask)
 
         # 4. Decoder
-        dec4 = self.up_decoder4(mttm_bottleneck, e4) 
+        dec4 = self.up_decoder4(stmi_bottleneck, e4)
         dec3 = self.up_decoder3(dec4, e3)
         dec2 = self.up_decoder2(dec3, e2) # (B, 32, H/2, W/2)
-        
+
         # 5. [关键修改] Early Fusion & Fast Upsampling
-        # 5a. 计算 AAD 分数 (低分辨率)
-        aad_score = self.cls(dec2) # (B, 1, H/2, W/2)
-        
+        # 5a. 计算 SHT 分数 (低分辨率)
+        sht_score = self.sht(dec2) # (B, 1, H/2, W/2)
+
         # 5b. 特征融合 (广播乘法)
-        # 将 anomaly score 作为注意力图，增强 dec2 特征
-        dec2_enhanced = dec2 * (1 + aad_score)
-        
+        # 将 SHT 分数作为注意力图，增强 dec2 特征
+        dec2_enhanced = dec2 * (1 + sht_score)
+
         # 5c. 通过 PixelShuffle 头直接输出全尺寸 Mask
         main_out = self.fast_head(dec2_enhanced) # (B, 1, H, W)
 
         if self.deepsuper:
-            ds_out5 = self.ds_conv5(mttm_bottleneck) 
+            ds_out5 = self.ds_conv5(stmi_bottleneck)
             ds_out4 = self.ds_conv4(dec4)
             ds_out3 = self.ds_conv3(dec3)
-            ds_out2 = self.ds_conv2(dec2) 
+            ds_out2 = self.ds_conv2(dec2)
 
             # DeepSupervision 依然需要双线性插值来对齐
-            target_size = main_out.shape[2:] 
+            target_size = main_out.shape[2:]
             ds_out5_up = F.interpolate(ds_out5, size=target_size, mode='bilinear', align_corners=True)
             ds_out4_up = F.interpolate(ds_out4, size=target_size, mode='bilinear', align_corners=True)
             ds_out3_up = F.interpolate(ds_out3, size=target_size, mode='bilinear', align_corners=True)
             ds_out2_up = F.interpolate(ds_out2, size=target_size, mode='bilinear', align_corners=True)
-            
+
             combined_ds_out = self.ds_outconv(torch.cat((ds_out2_up, ds_out3_up, ds_out4_up, ds_out5_up, main_out), dim=1))
 
             if self.mode == 'train':
                 return (torch.sigmoid(ds_out5_up), torch.sigmoid(ds_out4_up), torch.sigmoid(ds_out3_up),
                         torch.sigmoid(ds_out2_up), torch.sigmoid(combined_ds_out), torch.sigmoid(main_out)), \
                        cur_memory_list
-            else: 
+            else:
                 return torch.sigmoid(main_out), cur_memory_list
         else:
             return torch.sigmoid(main_out), cur_memory_list
@@ -296,7 +310,7 @@ if __name__ == '__main__':
     model.eval()
 
     inputs = torch.rand(1, 1, 512, 512).to(device) # Keeping 8 as per original request
-    
+
     print(f"Input shape: {inputs.shape}")
 
     num_frames_to_test = 3
@@ -305,13 +319,13 @@ if __name__ == '__main__':
     for i in range(num_frames_to_test):
         with torch.no_grad():
             output, current_memory_list = model(inputs, current_memory_list)
-        
+
         # Handle Output format (Single Tensor or Tuple)
         if isinstance(output, tuple):
              final_out = output[-1] if isinstance(output[-1], torch.Tensor) else output[0][-1]
         else:
              final_out = output
-             
+
         mem_info = 0
         if current_memory_list is not None:
             if isinstance(current_memory_list, torch.Tensor):
@@ -323,9 +337,9 @@ if __name__ == '__main__':
 
     try:
         # Pass dummy inputs to profile matching the forward signature
-        flops, params = profile(model, inputs=(inputs, None, None), verbose=False) 
+        flops, params = profile(model, inputs=(inputs, None, None), verbose=False)
         print("-" * 50)
-        print(f'FLOPs = {flops / 1000 ** 3:.2f} G (approx.)') 
+        print(f'FLOPs = {flops / 1000 ** 3:.2f} G (approx.)')
         print(f'Params = {params / 1000 ** 2:.2f} M')
     except Exception as e:
         print(f"Could not compute FLOPs/Params with thop: {e}")
@@ -334,8 +348,8 @@ if __name__ == '__main__':
     # # Timing test
     # print("-" * 50)
     # print("Running timing test...")
-    # num_timing_runs = 50 
-    
+    # num_timing_runs = 50
+
     # # Warm-up runs
     # for _ in range(10):
     #     with torch.no_grad():
@@ -345,9 +359,9 @@ if __name__ == '__main__':
     # temp_memory = None
     # for _ in range(num_timing_runs):
     #     with torch.no_grad():
-    #         _, temp_memory = model(inputs, temp_memory, None) 
+    #         _, temp_memory = model(inputs, temp_memory, None)
     # end_time = time.time()
-    
+
     # avg_time_per_batch = (end_time - start_time) / num_timing_runs
     # avg_time_per_frame = avg_time_per_batch / inputs.shape[0]
     # fps = 1.0 / avg_time_per_frame if avg_time_per_frame > 0 else 0
@@ -388,7 +402,7 @@ if __name__ == '__main__':
             "throughput_img_s": throughput,
             "bs": bs,
         }
-    
+
     print("-" * 50)
     print("Running timing test...")
     res = timing(model, inputs, device, num_warmup=20, num_runs=100, keep_memory=True)
